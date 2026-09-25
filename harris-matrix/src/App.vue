@@ -4,6 +4,7 @@ import MatrixCanvas from './components/MatrixCanvas.vue'
 import UnitPanel from './components/UnitPanel.vue'
 import RelationPanel from './components/RelationPanel.vue'
 import BatchPanel from './components/BatchPanel.vue'
+import SnapshotPanel from './components/SnapshotPanel.vue'
 import {
   autoLayout,
   cancelCycle,
@@ -64,13 +65,14 @@ function onImportFile(e: Event) {
       <aside class="sidebar">
         <UnitPanel />
         <RelationPanel />
+        <SnapshotPanel />
         <BatchPanel />
       </aside>
       <MatrixCanvas />
     </main>
 
     <footer class="statusbar">
-      数据仅保存于本机浏览器 IndexedDB，不上传任何现场资料。地层身份与画布位置分离存储；撤销以批次为单位，关系与证据引用一并恢复。
+      数据仅保存于本机浏览器 IndexedDB，不上传任何现场资料。地层身份与画布位置分离存储；撤销以批次为单位，关系与证据引用一并恢复；发布快照只读封存，版本单调递增，摘要链式校验可识别篡改。
     </footer>
 
     <!-- 成环确认对话框：给出完整环路径 -->
