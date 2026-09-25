@@ -1,15 +1,25 @@
 import { computed, reactive } from 'vue'
+import type { Table } from 'dexie'
 import { db } from './db'
 import { cyclePathIfAdded, layeredPositions, reachablePairs, redundantEdges, type OrderEdge } from './graph'
 import { buildSample } from './sample'
+import {
+  captureContent,
+  computeDigest,
+  validateForPublish,
+  verifySnapshot,
+  type WorkspaceData,
+} from './snapshot'
 import type {
   Batch,
   Evidence,
+  MetaRecord,
   Mutation,
   ProjectExport,
   Relation,
   RelationDraft,
   Retraction,
+  Snapshot,
   StratUnit,
   TableName,
   UnitPosition,
@@ -24,6 +34,12 @@ export const state = reactive({
   evidences: [] as Evidence[],
   retractions: [] as Retraction[],
   batches: [] as Batch[],
+  /** 已发布快照链：只增不删、不可覆写 */
+  snapshots: [] as Snapshot[],
+  /** 当前工作区派生自哪个快照版本；null 表示独立工作区 */
+  workspaceBase: null as number | null,
+  /** 各快照完整性复验结果（version → 问题列表；空数组表示完好） */
+  snapshotProblems: {} as Record<number, string[]>,
   viewMode: 'raw' as 'raw' | 'simplified',
   selectedUnitId: null as string | null,
   /** 待确认的成环关系：记录员可选择保留为矛盾记录或取消 */
@@ -60,6 +76,16 @@ export function evidenceRef(id: string): string {
   return state.evidences.find((e) => e.id === id)?.ref ?? id
 }
 
+/** 最近发布的版本号；尚未发布过快照时为 0 */
+export const latestVersion = computed(() =>
+  state.snapshots.reduce((m, s) => Math.max(m, s.version), 0),
+)
+
+export function snapshotLabel(version: number | null): string {
+  if (version === null) return '工作区'
+  return `快照 v${version}`
+}
+
 /* ---------- 基础工具 ---------- */
 
 const uid = () => crypto.randomUUID()
@@ -93,21 +119,59 @@ async function applyInverse(m: Mutation) {
 }
 
 export async function refresh() {
-  const [units, positions, relations, evidences, retractions, batches] = await Promise.all([
-    db.units.toArray(),
-    db.positions.toArray(),
-    db.relations.toArray(),
-    db.evidences.toArray(),
-    db.retractions.toArray(),
-    db.batches.orderBy('at').toArray(),
-  ])
+  const [units, positions, relations, evidences, retractions, batches, snapshots, baseMeta] =
+    await Promise.all([
+      db.units.toArray(),
+      db.positions.toArray(),
+      db.relations.toArray(),
+      db.evidences.toArray(),
+      db.retractions.toArray(),
+      db.batches.orderBy('at').toArray(),
+      db.snapshots.orderBy('version').toArray(),
+      db.meta.get('workspaceBase'),
+    ])
   state.units = units.sort((a, b) => a.label.localeCompare(b.label, 'zh-CN'))
   state.positions = Object.fromEntries(positions.map((p) => [p.unitId, p]))
   state.relations = relations.sort((a, b) => a.createdAt - b.createdAt)
   state.evidences = evidences.sort((a, b) => a.createdAt - b.createdAt)
   state.retractions = retractions.sort((a, b) => a.at - b.at)
   state.batches = batches
+  state.snapshots = snapshots
+  state.workspaceBase = baseMeta?.value ?? null
+  // 逐条重算摘要/闭包：篡改或损坏立即在快照链中暴露
+  const problems: Record<number, string[]> = {}
+  await Promise.all(
+    snapshots.map(async (s) => {
+      const v = await verifySnapshot(s)
+      if (!v.ok) problems[s.version] = v.problems
+    }),
+  )
+  state.snapshotProblems = problems
   state.loaded = true
+}
+
+/** 当前工作区数据（发布/导出前捕获用） */
+function currentWorkspaceData(): WorkspaceData {
+  return {
+    units: state.units.map((u) => ({ ...u })),
+    positions: Object.values(state.positions).map((p) => ({ ...p })),
+    relations: state.relations.map((r) => ({ ...r, evidenceIds: [...r.evidenceIds] })),
+    evidences: state.evidences.map((e) => ({ ...e })),
+    retractions: state.retractions.map((x) => ({
+      ...x,
+      snapshot: { ...x.snapshot, evidenceIds: [...x.snapshot.evidenceIds] },
+    })),
+  }
+}
+
+/** 供界面在发布前预检：成环冲突或悬空引用时列出全部原因 */
+export function checkPublishability() {
+  return validateForPublish(currentWorkspaceData())
+}
+
+/** 当前工作区的快照内容（差异审查中以“工作区”为一侧时使用） */
+export function currentContent() {
+  return captureContent(currentWorkspaceData())
 }
 
 /** 以批次执行一组变更：全部正向应用后登记批次，供整体撤销 */
@@ -288,6 +352,97 @@ export async function autoLayout() {
   toast('已按地层早晚自动分层排布')
 }
 
+/* ---------- 发布快照 / 从历史快照派生（单事务，失败不产生空版本） ---------- */
+
+const WORKSPACE_TABLES: Table[] = [
+  db.units,
+  db.positions,
+  db.relations,
+  db.evidences,
+  db.retractions,
+  db.batches,
+]
+
+/**
+ * 发布当前工作区为只读快照：
+ * - 发布前存在成环冲突或悬空引用时阻止，并列出全部原因；
+ * - 版本号在同一事务内取 max+1，保证单调，且 add 主键冲突会令事务回滚（并发发布也不覆写）；
+ * - 快照写入与工作区基线更新在同一事务内，任何一步失败整体回滚，不产生空版本。
+ * 返回新版本号；被阻止时返回 null。
+ */
+export async function publishSnapshot(note: string): Promise<number | null> {
+  const data = currentWorkspaceData()
+  const check = validateForPublish(data)
+  if (check.blocked) {
+    toast(`发布被阻止：${check.reasons[0]}（共 ${check.reasons.length} 项问题）`)
+    return null
+  }
+  const content = captureContent(data)
+  const digest = await computeDigest(content)
+  const publishedAt = Date.now()
+  let newVersion = 0
+  await db.transaction(
+    'rw',
+    [db.snapshots, db.meta],
+    async () => {
+      // 事务内读取，杜绝并发发布造成版本号重复
+      const last = await db.snapshots.orderBy('version').last()
+      newVersion = (last?.version ?? 0) + 1
+      const derivedFromVersion = (await db.meta.get('workspaceBase'))?.value ?? null
+      const snapshot: Snapshot = {
+        version: newVersion,
+        note: note.trim(),
+        publishedAt,
+        derivedFromVersion,
+        parentVersion: last?.version ?? null,
+        digest,
+        content,
+      }
+      // 主键冲突（版本号已存在）会让事务回滚，绝不覆写既有发布记录
+      await db.snapshots.add(snapshot)
+      const baseMeta: MetaRecord = { key: 'workspaceBase', value: newVersion, at: publishedAt }
+      await db.meta.put(baseMeta)
+    },
+  )
+  await refresh()
+  toast(`已发布只读快照 v${newVersion}`)
+  return newVersion
+}
+
+/**
+ * 从历史快照派生新的工作区版本：
+ * - 用快照内容原子替换工作区五张表（批次史一并重置，因旧批次不再适用于新工作区）；
+ * - snapshots 表绝不参与写入，已有发布记录不可覆写、不可删除；
+ * - 快照内容先复验摘要，被篡改/损坏则拒绝派生；
+ * - 基线指向被派生的旧版本，之后再发布时新版本号接在全链尾部，形成分支关系。
+ */
+export async function deriveWorkspace(version: number): Promise<boolean> {
+  const snapshot = await db.snapshots.get(version)
+  if (!snapshot) {
+    toast(`快照 v${version} 不存在`)
+    return false
+  }
+  const verification = await verifySnapshot(snapshot)
+  if (!verification.ok) {
+    toast(`派生被拒绝：${verification.problems[0]}`)
+    return false
+  }
+  const c = snapshot.content
+  await db.transaction('rw', WORKSPACE_TABLES.concat(db.meta), async () => {
+    await Promise.all(WORKSPACE_TABLES.map((t) => t.clear()))
+    await db.units.bulkPut(c.units.map((u) => plain(u)))
+    await db.positions.bulkPut(c.positions.map((p) => plain(p)))
+    await db.relations.bulkPut(c.relations.map((r) => plain(r)))
+    await db.evidences.bulkPut(c.evidences.map((e) => plain(e)))
+    await db.retractions.bulkPut(c.retractions.map((x) => plain(x)))
+    await db.meta.put({ key: 'workspaceBase', value: version, at: Date.now() } satisfies MetaRecord)
+  })
+  await refresh()
+  state.layoutVersion++
+  toast(`已从快照 v${version} 派生新工作区（发布记录链保持不变）`)
+  return true
+}
+
 /* ---------- 示例 / 清空 / 导出 / 导入 ---------- */
 
 export async function loadSample() {
@@ -314,34 +469,125 @@ export async function loadSample() {
 }
 
 export async function clearAll(confirm = true) {
-  if (confirm && !window.confirm('清空全部工程数据？此操作不可撤销。')) return
-  await db.transaction('rw', [db.units, db.positions, db.relations, db.evidences, db.retractions, db.batches], async () => {
-    await Promise.all([db.units.clear(), db.positions.clear(), db.relations.clear(), db.evidences.clear(), db.retractions.clear(), db.batches.clear()])
-  })
+  if (confirm && !window.confirm('清空全部工程数据（含已发布快照）？此操作不可撤销。')) return
+  await db.transaction(
+    'rw',
+    [db.units, db.positions, db.relations, db.evidences, db.retractions, db.batches, db.snapshots, db.meta],
+    async () => {
+      await Promise.all([
+        db.units.clear(),
+        db.positions.clear(),
+        db.relations.clear(),
+        db.evidences.clear(),
+        db.retractions.clear(),
+        db.batches.clear(),
+        db.snapshots.clear(),
+        db.meta.clear(),
+      ])
+    },
+  )
   state.selectedUnitId = null
   await refresh()
   if (confirm) toast('工程已清空')
 }
 
-export function exportProject() {
-  const data: ProjectExport = {
+/** 构造导出对象（纯数据，可脱离 DOM 复用/测试） */
+export function exportProjectData(): ProjectExport {
+  return {
     app: 'harris-matrix-workbench',
     version: 1,
     exportedAt: new Date().toISOString(),
-    units: state.units,
-    positions: Object.values(state.positions),
-    relations: state.relations,
-    evidences: state.evidences,
-    retractions: state.retractions,
+    units: state.units.map((u) => plain(u)),
+    positions: Object.values(state.positions).map((p) => plain(p)),
+    relations: state.relations.map((r) => plain(r)),
+    evidences: state.evidences.map((e) => plain(e)),
+    retractions: state.retractions.map((x) => plain(x)),
     partialOrder: reachablePairs(orderEdges.value),
+    // 发布链随工程一起往返：导入后逐条重算摘要，篡改即被识别
+    snapshots: state.snapshots.map((s) => plain(s)),
+    workspaceBase: state.workspaceBase,
   }
+}
+
+export function exportProject() {
+  const data = exportProjectData()
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
   const a = document.createElement('a')
   a.href = URL.createObjectURL(blob)
   a.download = `harris-matrix-${new Date().toISOString().slice(0, 10)}.json`
   a.click()
   URL.revokeObjectURL(a.href)
-  toast(`已导出（偏序闭包 ${data.partialOrder.length} 个可达对）`)
+  toast(`已导出（偏序闭包 ${data.partialOrder.length} 个可达对，快照 ${data.snapshots?.length ?? 0} 个）`)
+}
+
+export interface ImportResult {
+  ok: boolean
+  message: string
+}
+
+/**
+ * 从导出对象导入（纯数据）。先复验文件内全部快照摘要，任一不符则整次拒绝、
+ * 不写入任何表；通过后以单事务清空并替换全部工程数据。
+ */
+export async function importProjectData(data: ProjectExport): Promise<ImportResult> {
+  if (data?.app !== 'harris-matrix-workbench' || !Array.isArray(data.units) || !Array.isArray(data.relations)) {
+    return { ok: false, message: '导入失败：文件格式不符' }
+  }
+  // 导入前在事务外先复验文件内快照摘要：篡改/损坏的快照不允许进入发布链
+  const importedSnapshots = data.snapshots ?? []
+  const tampered: string[] = []
+  for (const s of importedSnapshots) {
+    try {
+      const v = await verifySnapshot(s)
+      if (!v.ok) tampered.push(...v.problems)
+    } catch {
+      tampered.push(`快照 v${s?.version ?? '?'} 结构损坏，无法复验摘要`)
+    }
+  }
+  if (tampered.length > 0) {
+    return {
+      ok: false,
+      message: `导入被拒绝：工程文件中有 ${tampered.length} 个快照摘要校验失败，疑似被篡改或损坏`,
+    }
+  }
+  await db.transaction(
+    'rw',
+    [db.units, db.positions, db.relations, db.evidences, db.retractions, db.batches, db.snapshots, db.meta],
+    async () => {
+      await Promise.all([
+        db.units.clear(),
+        db.positions.clear(),
+        db.relations.clear(),
+        db.evidences.clear(),
+        db.retractions.clear(),
+        db.batches.clear(),
+        db.snapshots.clear(),
+        db.meta.clear(),
+      ])
+      await db.units.bulkPut(data.units)
+      await db.positions.bulkPut(data.positions ?? [])
+      await db.relations.bulkPut(data.relations)
+      await db.evidences.bulkPut(data.evidences ?? [])
+      await db.retractions.bulkPut(data.retractions ?? [])
+      await db.snapshots.bulkAdd(importedSnapshots)
+      if (data.workspaceBase !== undefined) {
+        await db.meta.put({ key: 'workspaceBase', value: data.workspaceBase ?? null, at: null } satisfies MetaRecord)
+      }
+    },
+  )
+  await refresh()
+  state.layoutVersion++
+  // 偏序一致性校验：重算可达对并与导出快照比对
+  const expected = [...(data.partialOrder ?? [])].sort()
+  const actual = reachablePairs(orderEdges.value)
+  const same = JSON.stringify(expected) === JSON.stringify(actual)
+  const snapNote = importedSnapshots.length > 0 ? `；已复验 ${importedSnapshots.length} 个快照摘要` : ''
+  return {
+    ok: same,
+    message: same
+      ? `导入完成，偏序校验一致（${actual.length} 个可达对）${snapNote}`
+      : '导入完成，但偏序与导出时不一致，请检查数据',
+  }
 }
 
 export async function importProject(file: File) {
@@ -352,24 +598,7 @@ export async function importProject(file: File) {
     toast('导入失败：不是有效的 JSON 文件')
     return
   }
-  if (data?.app !== 'harris-matrix-workbench' || !Array.isArray(data.units) || !Array.isArray(data.relations)) {
-    toast('导入失败：文件格式不符')
-    return
-  }
-  if (!window.confirm('导入将替换当前工程（不可撤销），继续？')) return
-  await db.transaction('rw', [db.units, db.positions, db.relations, db.evidences, db.retractions, db.batches], async () => {
-    await Promise.all([db.units.clear(), db.positions.clear(), db.relations.clear(), db.evidences.clear(), db.retractions.clear(), db.batches.clear()])
-    await db.units.bulkPut(data.units)
-    await db.positions.bulkPut(data.positions ?? [])
-    await db.relations.bulkPut(data.relations)
-    await db.evidences.bulkPut(data.evidences ?? [])
-    await db.retractions.bulkPut(data.retractions ?? [])
-  })
-  await refresh()
-  state.layoutVersion++
-  // 偏序一致性校验：重算可达对并与导出快照比对
-  const expected = [...(data.partialOrder ?? [])].sort()
-  const actual = reachablePairs(orderEdges.value)
-  const same = JSON.stringify(expected) === JSON.stringify(actual)
-  toast(same ? `导入完成，偏序校验一致（${actual.length} 个可达对）` : '导入完成，但偏序与导出时不一致，请检查数据')
+  if (!window.confirm('导入将替换当前工程（含已发布快照，不可撤销），继续？')) return
+  const result = await importProjectData(data)
+  toast(result.message)
 }

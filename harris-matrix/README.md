@@ -9,7 +9,23 @@ Cytoscape.js 绘制矩阵，Dexie(IndexedDB) 本地持久化。**不发生任何
 npm install
 npm run dev      # 开发
 npm run build    # 产出静态文件到 dist/，可离线部署
+npm test         # 验收测试（vitest + fake-indexeddb）
 ```
+
+## 发布快照与差异审查
+
+- **只读发布**：可把当前层位、位置、全部关系（含撤回/冲突状态）与证据发布为只读快照。
+  版本号在**同一个 IndexedDB 事务**内取 `max+1`，单调稳定；快照带说明、`derivedFromVersion`/`parentVersion`
+  版本关系与 SHA-256 内容摘要。`snapshots` 表只使用 `add`，应用层没有任何覆写或删除路径，发布失败整体回滚、不产生空版本。
+- **发布前校验**：存在**成环冲突**（逐条给出完整环路径）或**悬空引用**（层位/证据/关系）时阻止发布并列出全部原因；
+  修复后可用同一动作重试。
+- **差异三分**：任选两个快照、或快照与当前工作区比较，差异区分为
+  ① 实体变化（层位/位置/证据/撤回记录）、② 直接关系记录变化（增删改、撤回、冲突标记）、
+  ③ **仅由闭包推导造成的语义变化**（可达对增删中排除直接边增删）；直接边若为传递冗余边会标注“无语义影响”。
+- **从历史快照派生**：可把任一历史快照内容原子替换为新工作区（单事务），快照链本身绝不被写入；
+  派生后再发布，新版本号接全链尾部并记录 `derivedFromVersion`，形成可追溯的分支。
+- **完整性**：每次刷新逐条重算摘要与偏序闭包；工程 JSON 导出携带快照链，导入前先逐条复验，
+  任何内容篡改（或结构损坏）都会被识别并拒绝导入/派生。
 
 ## 数据模型要点
 
@@ -31,9 +47,12 @@ npm run build    # 产出静态文件到 dist/，可离线部署
 ## 目录
 
 ```
-src/graph.ts   Graphology 封装：成环路径、传递约简、偏序闭包、分层排布
-src/store.ts   状态与业务：批次撤销、导入导出、偏序校验
-src/db.ts      Dexie/IndexedDB 六张表
-src/sample.ts  示例工程
-src/components/MatrixCanvas.vue  Cytoscape 画布
+src/graph.ts     Graphology 封装：成环路径、传递约简、偏序闭包、分层排布
+src/snapshot.ts  快照捕获、规范化 SHA-256 摘要、成环/悬空校验、三类差异、完整性复验
+src/store.ts     状态与业务：发布/派生（单事务）、批次撤销、导入导出、偏序校验
+src/db.ts        Dexie/IndexedDB 八张表（v2 新增 snapshots / meta）
+src/sample.ts    示例工程
+src/components/SnapshotPanel.vue  发布、快照链与差异审查
+src/components/MatrixCanvas.vue   Cytoscape 画布
+tests/snapshot.test.ts            发布快照与差异审查的验收测试
 ```

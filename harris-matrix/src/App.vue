@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from 'vue'
 import MatrixCanvas from './components/MatrixCanvas.vue'
 import UnitPanel from './components/UnitPanel.vue'
 import RelationPanel from './components/RelationPanel.vue'
+import SnapshotPanel from './components/SnapshotPanel.vue'
 import BatchPanel from './components/BatchPanel.vue'
 import {
   autoLayout,
@@ -62,6 +63,7 @@ function onImportFile(e: Event) {
 
     <main class="main">
       <aside class="sidebar">
+        <SnapshotPanel />
         <UnitPanel />
         <RelationPanel />
         <BatchPanel />

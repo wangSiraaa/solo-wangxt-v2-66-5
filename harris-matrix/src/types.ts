@@ -84,7 +84,50 @@ export interface RelationDraft {
   note: string
 }
 
-/** 导出文件格式：携带偏序闭包用于导入校验 */
+/** 快照承载的完整工程内容：发布时刻的层位、位置、全部关系（含撤回/冲突状态） */
+export interface SnapshotContent {
+  app: 'harris-matrix-workbench'
+  contentVersion: 1
+  units: StratUnit[]
+  positions: UnitPosition[]
+  relations: Relation[]
+  evidences: Evidence[]
+  retractions: Retraction[]
+  /** 活跃“早于”关系的偏序闭包（发布时计算并冻结，导入后可重算比对） */
+  partialOrder: string[]
+}
+
+/**
+ * 只读发布快照：单调版本号、说明与内容摘要（digest）。
+ * 一经写入，应用层不再提供任何覆写或删除路径；派生工作区也只重建工作区表，绝不触碰本表。
+ */
+export interface Snapshot {
+  /** 单调版本号，从 1 开始，在发布事务内取 max+1 */
+  version: number
+  /** 发布说明 */
+  note: string
+  publishedAt: number
+  /** 发布时工作区所基于的快照版本；null 表示从独立工作区发布 */
+  derivedFromVersion: number | null
+  /** 发布链上的上一版本号；首版为 null */
+  parentVersion: number | null
+  /** 内容指纹 sha256(规范化 JSON(content))，篡改内容即可被识别 */
+  digest: string
+  content: SnapshotContent
+}
+
+/** meta 表键：当前工作区的派生基线 */
+export type MetaKey = 'workspaceBase'
+
+export interface MetaRecord {
+  key: MetaKey
+  /** 当前工作区派生自哪个快照；null 表示未基于任何快照 */
+  value: number | null
+  /** 最近一次发布或派生的时间 */
+  at: number | null
+}
+
+/** 导出文件格式：携带偏序闭包与已发布快照，用于导入校验 */
 export interface ProjectExport {
   app: 'harris-matrix-workbench'
   version: 1
@@ -96,4 +139,8 @@ export interface ProjectExport {
   retractions: Retraction[]
   /** 活跃“早于”关系的可达对闭包（排序后），导入时重算比对 */
   partialOrder: string[]
+  /** 已发布快照链（旧文件可能缺省）；每条摘要随文件往返，导入后逐条复验 */
+  snapshots?: Snapshot[]
+  /** 当前工作区的派生基线（旧文件可能缺省） */
+  workspaceBase?: number | null
 }
